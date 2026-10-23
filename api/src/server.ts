@@ -934,57 +934,59 @@ async function generateExplanation(row: {
 let lastSeenTimestamp = new Date(0);
 const processedTxHashes = new Set<string>();
 
-(async () => {
-    try {
-        const latest = await pool.query(
-            `SELECT created_at FROM compliance_decisions ORDER BY created_at DESC LIMIT 1`
-        );
-        if (latest.rows.length > 0) {
-            lastSeenTimestamp = new Date(latest.rows[0].created_at);
+if (process.env.NODE_ENV !== 'test') {
+    (async () => {
+        try {
+            const latest = await pool.query(
+                `SELECT created_at FROM compliance_decisions ORDER BY created_at DESC LIMIT 1`
+            );
+            if (latest.rows.length > 0) {
+                lastSeenTimestamp = new Date(latest.rows[0].created_at);
+            }
+        } catch {
+            // Ignore if table not yet initialized
         }
-    } catch {
-        // Ignore if table not yet initialized
-    }
-})();
+    })();
 
-setInterval(async () => {
-    try {
-        const result = await pool.query(
-            `SELECT tx_hash, sender, recipient, decision, risk_score, reason_codes, ai_explanation,
-              counterparty_entity_type, exposure_hop_distance, policy_version, integrity_hash, created_at
-       FROM compliance_decisions
-       WHERE created_at >= $1
-       ORDER BY created_at ASC
-       LIMIT 100`,
-            [lastSeenTimestamp]
-        );
+    setInterval(async () => {
+        try {
+            const result = await pool.query(
+                `SELECT tx_hash, sender, recipient, decision, risk_score, reason_codes, ai_explanation,
+                  counterparty_entity_type, exposure_hop_distance, policy_version, integrity_hash, created_at
+           FROM compliance_decisions
+           WHERE created_at >= $1
+           ORDER BY created_at ASC
+           LIMIT 100`,
+                [lastSeenTimestamp]
+            );
 
-        for (const row of result.rows) {
-            if (processedTxHashes.has(row.tx_hash)) {
-                continue;
+            for (const row of result.rows) {
+                if (processedTxHashes.has(row.tx_hash)) {
+                    continue;
+                }
+                processedTxHashes.add(row.tx_hash);
+
+                if (processedTxHashes.size > 5000) {
+                    const oldest = processedTxHashes.values().next().value;
+                    if (oldest) processedTxHashes.delete(oldest);
+                }
+
+                const rowTime = new Date(row.created_at);
+                if (rowTime > lastSeenTimestamp) {
+                    lastSeenTimestamp = rowTime;
+                }
+
+                broadcast({ type: 'new_decision', data: row });
+
+                if ((row.decision === 'BLOCK' || row.decision === 'FLAG') && !row.ai_explanation) {
+                    generateExplanation(row);
+                }
             }
-            processedTxHashes.add(row.tx_hash);
-
-            if (processedTxHashes.size > 5000) {
-                const oldest = processedTxHashes.values().next().value;
-                if (oldest) processedTxHashes.delete(oldest);
-            }
-
-            const rowTime = new Date(row.created_at);
-            if (rowTime > lastSeenTimestamp) {
-                lastSeenTimestamp = rowTime;
-            }
-
-            broadcast({ type: 'new_decision', data: row });
-
-            if ((row.decision === 'BLOCK' || row.decision === 'FLAG') && !row.ai_explanation) {
-                generateExplanation(row);
-            }
+        } catch (err) {
+            fastify.log.error(`Polling error in decision watcher: ${err}`);
         }
-    } catch (err) {
-        fastify.log.error(`Polling error in decision watcher: ${err}`);
-    }
-}, 500);
+    }, 500);
+}
 
 async function generateBidSummary(row: {
     id: string | number;
@@ -1046,45 +1048,47 @@ async function generateBidSummary(row: {
 
 // Relay bids watcher
 let lastSeenBidId = 0;
-(async () => {
-    try {
-        const latest = await pool.query(
-            `SELECT id FROM relay_bids ORDER BY id DESC LIMIT 1`
-        );
-        if (latest.rows.length > 0) {
-            lastSeenBidId = Math.max(0, Number(latest.rows[0].id) - 100);
-        }
-    } catch {
-        // ignore
-    }
-})();
-
-setInterval(async () => {
-    try {
-        const result = await pool.query(
-            `SELECT id, slot, builder_id, block_hash, fee_recipient, value_wei, verdict, reasons, ai_summary, created_at
-             FROM relay_bids
-             WHERE id > $1 OR (ai_summary IS NULL AND verdict != 'PENDING')
-             ORDER BY id ASC
-             LIMIT 25`,
-            [lastSeenBidId]
-        );
-
-        for (const row of result.rows) {
-            const numId = Number(row.id);
-            if (numId > lastSeenBidId) {
-                lastSeenBidId = numId;
-                broadcast({ type: 'bid_verdict', data: row });
+if (process.env.NODE_ENV !== 'test') {
+    (async () => {
+        try {
+            const latest = await pool.query(
+                `SELECT id FROM relay_bids ORDER BY id DESC LIMIT 1`
+            );
+            if (latest.rows.length > 0) {
+                lastSeenBidId = Math.max(0, Number(latest.rows[0].id) - 100);
             }
-
-            if (!row.ai_summary && row.verdict !== 'PENDING') {
-                await generateBidSummary(row);
-            }
+        } catch {
+            // ignore
         }
-    } catch (err) {
-        // quiet
-    }
-}, 500);
+    })();
+
+    setInterval(async () => {
+        try {
+            const result = await pool.query(
+                `SELECT id, slot, builder_id, block_hash, fee_recipient, value_wei, verdict, reasons, ai_summary, created_at
+                 FROM relay_bids
+                 WHERE id > $1 OR (ai_summary IS NULL AND verdict != 'PENDING')
+                 ORDER BY id ASC
+                 LIMIT 25`,
+                [lastSeenBidId]
+            );
+
+            for (const row of result.rows) {
+                const numId = Number(row.id);
+                if (numId > lastSeenBidId) {
+                    lastSeenBidId = numId;
+                    broadcast({ type: 'bid_verdict', data: row });
+                }
+
+                if (!row.ai_summary && row.verdict !== 'PENDING') {
+                    await generateBidSummary(row);
+                }
+            }
+        } catch (err) {
+            // quiet
+        }
+    }, 500);
+}
 
 // --- Chainlink Functions On-Chain Identity Registry Simulation & Cache ---
 // Blocked nationalities (ISO-3166 numeric) — mirrors ComplianceRegistry.blockedCountryCode.
@@ -1374,10 +1378,14 @@ fastify.post('/api/compliance/identity/revoke', async (request, reply) => {
 const port = Number(process.env.PORT) || 3002;
 const host = process.env.HOST || '0.0.0.0';
 
-fastify.listen({ port, host }, (err) => {
-    if (err) {
-        fastify.log.error(err);
-        process.exit(1);
-    }
-    console.log(`Fastify orchestration layer listening on http://${host}:${port}`);
-});
+if (process.env.NODE_ENV !== 'test') {
+    fastify.listen({ port, host }, (err) => {
+        if (err) {
+            fastify.log.error(err);
+            process.exit(1);
+        }
+        console.log(`Fastify orchestration layer listening on http://${host}:${port}`);
+    });
+}
+
+export { fastify, verifyAdminAuth, checkRateLimit, pool };
